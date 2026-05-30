@@ -22,6 +22,7 @@ import { requestIdMiddleware } from './middleware/requestId.middleware';
 import metricsRoutes from './routes/metrics.routes';
 import adminMetricsRoutes from './routes/admin-metrics.routes';
 import corsDiagnosticsRoutes from './routes/admin-cors-diagnostics.routes';
+import deadLetterRoutes from './routes/admin-dead-letter.routes';
 import chatRoutes from "./routes/chat.routes";
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './docs/openapi';
@@ -135,6 +136,7 @@ export function createApp(): Express {
   app.use("/api/notifications", notificationsRoutes);
   app.use("/api/admin/metrics", adminMetricsRoutes);
   app.use("/api/admin/cors-diagnostics", corsDiagnosticsRoutes);
+  app.use("/api/admin/dead-letter", deadLetterRoutes);
 
   // Prometheus metrics endpoint
   app.use('/metrics', metricsRoutes);

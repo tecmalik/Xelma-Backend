@@ -556,6 +556,36 @@ Expected response:
 
 ---
 
+### Dead-letter queue for failed notifications and events
+
+Notification creation and WebSocket emits go through a dead-letter queue
+(DLQ) so a transient DB blip, a not-yet-initialized socket layer, or a
+runtime exception in `emit` does not silently drop a user-facing event.
+
+How it works:
+
+- `notificationService.createNotification(...)` records a `FailedDispatch`
+  row on `NOTIFICATION_CREATE` errors (the original error still rethrows
+  so callers behave the same).
+- `websocketService.emit*(...)` records a `FailedDispatch` row whenever
+  the socket layer is not initialized or the underlying `emit` throws.
+  The emit itself is fire-and-forget — the caller's hot path is never
+  broken by a DLQ persistence failure.
+- Rows have `attempts`, `lastError`, and `status` (`PENDING`, `RETRYING`,
+  `RESOLVED`, `ABANDONED`) so an operator can triage stuck dispatches.
+
+Operator endpoints (admin-only, gated by `requireAdmin`):
+
+- `GET  /api/admin/dead-letter` — list entries, newest first. Query
+  params: `status`, `channel`, `limit`, `offset`.
+- `POST /api/admin/dead-letter/:id/retry` — replay a single entry; sets
+  `RESOLVED` on success, bumps `attempts` and moves to `ABANDONED` once
+  the cap (default 5) is reached.
+- `POST /api/admin/dead-letter/retry-all` — replay every `PENDING` /
+  `RETRYING` entry (capped, oldest first). Returns a counts summary.
+
+---
+
 ## API Documentation
 
 The backend provides auto-generated **OpenAPI/Swagger** documentation.
