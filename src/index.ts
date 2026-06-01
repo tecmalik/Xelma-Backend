@@ -1,3 +1,12 @@
+// Enforce Node.js 22+ runtime requirement at startup before loading any modules
+const nodeMajorVersion = parseInt(process.versions.node.split('.')[0], 10);
+if (nodeMajorVersion < 22) {
+  console.error(`🔥 CRITICAL ERROR: Application startup failed.`);
+  console.error(`Node.js v22.x or higher is required. You are running v${process.version}.`);
+  console.error(`Please upgrade Node.js to avoid local vs Render mismatches.`);
+  process.exit(1);
+}
+
 import express, { Express, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
