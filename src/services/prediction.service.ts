@@ -1,4 +1,5 @@
 import type { Prisma } from '@prisma/client';
+import { OutboxEventType } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { invalidateNamespace, invalidateLeaderboardSortedSet } from '../lib/redis';
 import { UserPriceRange } from '../types/round.types';
@@ -11,7 +12,7 @@ import {
 } from '../utils/errors';
 import logger from '../utils/logger';
 import { retryOrThrow } from '../utils/retry.util';
-import { storeIdempotencyResult } from '../utils/idempotency.util';
+import { predictionsPlacedTotal } from '../metrics/application.metrics';
 import {
    findRangeByBounds,
    parseRoundPriceRanges,
@@ -30,7 +31,6 @@ export class PredictionService {
       amount: number,
       side?: 'UP' | 'DOWN',
       priceRange?: UserPriceRange,
-      idempotencyKey?: string
    ): Promise<any> {
       // Wrap with retry logic to handle transient DB conflicts and race conditions
       return retryOrThrow(
@@ -40,8 +40,7 @@ export class PredictionService {
                roundId,
                amount,
                side,
-               priceRange,
-               idempotencyKey
+               priceRange
             ),
          'submitPrediction',
          {
@@ -63,7 +62,6 @@ export class PredictionService {
       amount: number,
       side?: 'UP' | 'DOWN',
       priceRange?: UserPriceRange,
-      idempotencyKey?: string
    ): Promise<any> {
       try {
          const prediction = await prisma.$transaction(async tx => {
@@ -199,6 +197,29 @@ export class PredictionService {
                // This is our rollback strategy: DB transaction will only commit if placeBet succeeds.
                await sorobanService.placeBet(user.walletAddress, amount, side!);
 
+               // 9. Write prediction:placed websocket outbox event atomically with the
+               // prediction row. The outbox poller dispatches it after commit so the
+               // event is never lost if the process crashes between the transaction
+               // commit and an in-process emit call.
+               await tx.outboxEvent.create({
+                  data: {
+                     eventType: OutboxEventType.WEBSOCKET_EMIT,
+                     aggregateId: prediction.id,
+                     aggregateType: 'prediction',
+                     payload: {
+                        eventName: 'prediction:placed',
+                        room: 'round',
+                        data: {
+                           roundId,
+                           predictionId: prediction.id,
+                           amount: toNumber(prediction.amount),
+                           side: prediction.side,
+                           priceRange: prediction.priceRange,
+                        },
+                     },
+                  },
+               });
+
                logger.info(
                   `Prediction submitted (UP_DOWN): user=${userId}, round=${roundId}, side=${side}`
                );
@@ -219,6 +240,27 @@ export class PredictionService {
                   },
                });
 
+               // Write prediction:placed websocket outbox event atomically with the
+               // prediction row for LEGENDS mode.
+               await tx.outboxEvent.create({
+                  data: {
+                     eventType: OutboxEventType.WEBSOCKET_EMIT,
+                     aggregateId: prediction.id,
+                     aggregateType: 'prediction',
+                     payload: {
+                        eventName: 'prediction:placed',
+                        room: 'round',
+                        data: {
+                           roundId,
+                           predictionId: prediction.id,
+                           amount: toNumber(prediction.amount),
+                           side: prediction.side,
+                           priceRange: prediction.priceRange,
+                        },
+                     },
+                  },
+               });
+
                logger.info(
                   `Prediction submitted (LEGENDS): user=${userId}, round=${roundId}, range=${JSON.stringify(priceRange)}`
                );
@@ -231,29 +273,7 @@ export class PredictionService {
          void invalidateNamespace('leaderboard');
          void invalidateLeaderboardSortedSet();
 
-         // Store idempotency result if key provided
-         if (idempotencyKey) {
-            const responseBody = {
-               success: true,
-               prediction: {
-                  id: prediction.id,
-                  roundId: prediction.roundId,
-                  userId: prediction.userId,
-                  amount: toNumber(prediction.amount),
-                  side: prediction.side,
-                  priceRange: prediction.priceRange,
-                  createdAt: prediction.createdAt,
-               },
-            };
-            void storeIdempotencyResult(
-               userId,
-               '/api/predictions/submit',
-               idempotencyKey,
-               { roundId, amount, side, priceRange },
-               200,
-               responseBody
-            );
-         }
+         predictionsPlacedTotal.inc();
 
          return prediction;
       } catch (error) {

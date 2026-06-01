@@ -58,6 +58,8 @@ The platform supports two game modes:
 - ✅ **WebSocket Support**: Live updates for prices, rounds, chat, and notifications
 - ✅ **Leaderboard System**: Tracks wins, earnings, and streaks across game modes
 - ✅ **Automated Schedulers**: Cron jobs for round creation, locking, and resolution
+- ✅ **Transactional Outbox**: Notification and WebSocket side-effects are written atomically with DB commits — guaranteed at-least-once delivery even across process crashes
+- ✅ **Dead-Letter Queue**: Failed dispatches are persisted and replayable via admin endpoints
 - ✅ **OpenAPI Documentation**: Auto-generated Swagger UI at `/api-docs`
 - ✅ **Rate Limiting**: Protects endpoints from abuse
 - ✅ **Comprehensive Logging**: Winston-based logging for debugging and monitoring
@@ -237,6 +239,15 @@ Xelma-Backend/
 > dedicated worker process runs background jobs while one or more
 > stateless processes serve HTTP — and for safer local debugging.
 
+#### **8a. Outbox Service (`outbox.service.ts`)** — Issue #18
+- **Purpose**: Guarantees at-least-once delivery of notification and WebSocket side-effects
+- **How it works**:
+  1. Business transactions (payout, prediction) write `OutboxEvent` rows *inside* the same `prisma.$transaction()` call — atomically with the state change.
+  2. A background poller (cron, every `OUTBOX_POLL_INTERVAL_SECONDS`) reads `PENDING` rows and dispatches them.
+  3. On success the row is marked `PROCESSED`. On failure `attempts` is incremented; once `OUTBOX_MAX_ATTEMPTS` is reached the row is marked `FAILED` and escalated to the existing DLQ.
+- **Why this matters**: Before this change, notifications fired *after* the transaction committed. A process crash between commit and notification call silently dropped the event. Now the event is durable from the moment the transaction commits.
+- **Env vars**: `OUTBOX_POLL_INTERVAL_SECONDS`, `OUTBOX_BATCH_SIZE`, `OUTBOX_MAX_ATTEMPTS`, `OUTBOX_RETENTION_DAYS`
+
 #### **9. Notification Service (`notification.service.ts`)**
 - **Purpose**: Creates and delivers notifications to users
 - **Types**: WIN, LOSS, ROUND_START, BONUS_AVAILABLE, ANNOUNCEMENT
@@ -308,6 +319,7 @@ Xelma-Backend/
 #### **System Endpoints**
 - `GET /` - Health check with timestamp
 - `GET /health` - Detailed health check (uptime, status)
+- `GET /metrics` - Prometheus metrics for HTTP, schedulers, oracle, predictions, WebSocket, rate limits, and DB pool settings
 - `GET /api/price` - Current XLM/USD price as a decimal string with staleness info
 - `GET /api-docs` - Swagger UI documentation
 - `GET /api-docs.json` - OpenAPI specification
@@ -491,27 +503,37 @@ Prisma’s Postgres connector reads pool/timeouts via connection string query pa
 - **Visibility**: scrape `/metrics` and look for `db_pool_settings_info` to see the effective values.
 - **Validation**: invalid values are rejected at startup via config validation.
 
-#### Leaderboard cache tuning
+#### Metrics contract
 
-| Variable | Description | Default |
+`GET /metrics` exposes Prometheus text-format metrics with only
+low-cardinality labels. Labels intentionally avoid user IDs, wallet addresses,
+round IDs, socket IDs, request bodies, and secrets.
+
+Core application metrics include:
+
+| Metric | Labels | Meaning |
 | --- | --- | --- |
-| `LEADERBOARD_CACHE_TTL_SECONDS` | TTL for the per-page JSON cache entry. | `60` |
-| `LEADERBOARD_ZSET_TTL_SECONDS` | Safety-net TTL for the materialized sorted set. `0` disables automatic expiry; the set is invalidated explicitly after every round resolution. | `300` |
-
-The leaderboard uses a two-layer caching strategy:
-
-1. **Materialized sorted set (ZSET)** — Redis sorted set keyed by `totalEarnings`. Rank lookups are O(log N) instead of a full-table `COUNT(*)`. The set is updated after every `updateUserStatsForRound` call and flushed whenever the `leaderboard` namespace is invalidated.
-2. **Versioned JSON page cache** — The assembled leaderboard page (with wallet masking, accuracy, mode stats) is stored in the existing versioned namespace cache with a short TTL. This avoids re-fetching `UserStats` rows on every HTTP request.
-
-When Redis is unavailable both layers degrade gracefully to direct DB queries.
+| `http_requests_total` | `method`, `route`, `status_code` | HTTP request volume by normalized Express route |
+| `http_request_duration_seconds` | `method`, `route`, `status_code` | HTTP latency histogram |
+| `http_errors_total` | `method`, `route`, `status_code` | HTTP 4xx/5xx responses |
+| `predictions_placed_total` | none | Successful prediction submissions |
+| `rounds_started_total` | `mode` | Rounds created by game mode |
+| `rounds_resolved_total` | `mode` | Rounds resolved by game mode |
+| `price_oracle_updates_total` | none | Successful oracle price refreshes |
+| `price_oracle_fetch_failures_total` | `reason` | Oracle refresh failures |
+| `scheduler_runs_total` | `job`, `outcome` | Scheduler executions |
+| `scheduler_items_processed_total` | `job`, `outcome` | Items processed by scheduler jobs |
+| `socket_connections_active` | none | Current Socket.IO connections |
+| `websocket_emits_total` | `event`, `outcome` | WebSocket dispatch attempts |
+| `websocket_connection_events_total` | `event`, `authenticated` | Socket connect/disconnect events |
 
 ### 3. Set Up Database
 
 ```bash
-# Generate Prisma client
-npm run prisma:generate
+# Generate Prisma client and apply committed migrations
+npm run db:prepare
 
-# Run migrations
+# Create a new development migration when changing prisma/schema.prisma
 npm run prisma:migrate
 
 # (Optional) Seed database with sample data
@@ -531,6 +553,20 @@ npm run dev
 ```
 
 The server will start on `http://localhost:3000` with auto-reload on file changes.
+
+### Local Render-Parity Bootstrap
+
+Use one command when you want local startup to perform the same Prisma
+preparation Render performs before booting the service:
+
+```bash
+npm run dev:render-parity
+```
+
+This runs `prisma generate`, applies committed migrations with
+`prisma migrate deploy`, then starts the hot-reload dev server. It expects a
+local `.env` with at least `DATABASE_URL` and `JWT_SECRET`; copy
+`.env.example` to `.env` if you are starting from a fresh checkout.
 
 ### Production Mode
 
@@ -750,6 +786,7 @@ GET /api/rounds/active
 POST /api/predictions/submit
 Authorization: Bearer YOUR_JWT_TOKEN
 Content-Type: application/json
+Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
 
 # For UP_DOWN mode:
 {
@@ -768,6 +805,13 @@ Content-Type: application/json
   }
 }
 ```
+
+`Idempotency-Key` is optional but recommended for clients that may retry a
+submit request after network failure. The same authenticated user can retry the
+same request body with the same key for 10 minutes and receive the cached
+response. Reusing the same key with a different request body returns `409` with
+code `IDEMPOTENCY_KEY_CONFLICT`; generate a fresh key for a new prediction
+attempt.
 
 **Response:**
 ```json
@@ -879,7 +923,32 @@ npm run ci
 
 # Run tests in watch mode
 npm run test:watch
+
+# Repeatable load baselines for prediction throughput + websocket fanout (#21)
+npm run test:load
 ```
+
+### Load test harness (#21)
+
+`npm run test:load` runs `src/tests/performance.spec.ts`, which exercises:
+
+- **Single-request latency baselines** for auth, active rounds, and prediction submit (#152).
+- **Concurrent prediction throughput** — N parallel `POST /api/predictions/submit` requests with aggregate RPS and p95 latency assertions.
+- **WebSocket fanout** — M clients join the `round` room and must receive `prediction:placed` within the configured p95 budget.
+
+The harness lives in `src/tests/load-test.harness.ts` and uses mocked Prisma/Soroban so it stays repeatable in CI without a live database. Tune thresholds via env vars (see `.env.example` → “Load / performance test harness”):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `LOAD_TEST_PREDICTION_CONCURRENCY` | `10` | Max in-flight prediction requests |
+| `LOAD_TEST_PREDICTION_ITERATIONS` | `30` | Total prediction requests per run |
+| `LOAD_TEST_PREDICTION_MIN_RPS` | `5` | Minimum acceptable throughput |
+| `LOAD_TEST_PREDICTION_P95_MS` | `500` | Max p95 latency for predictions |
+| `LOAD_TEST_WS_CLIENTS` | `20` | Connected sockets for fanout test |
+| `LOAD_TEST_WS_MIN_DELIVERY_RATE` | `1` | Minimum delivery ratio (0–1) |
+| `LOAD_TEST_WS_P95_MS` | `250` | Max p95 fanout delivery time |
+
+Each run prints `[LOAD]` summary lines to stdout for before/after comparisons in PRs.
 
 Coverage thresholds are enforced in `jest.config.ts` for lines, branches, functions, and statements. The current floor is intentionally conservative and excludes tests, mocks, generated files, scripts, and vendored bindings so the gate tracks application code. CI runs `npm run test:unit:coverage`, prints the Jest coverage summary, uploads `coverage/`, and fails when the thresholds are not met.
 
@@ -896,14 +965,18 @@ Current test coverage includes:
 |--------|-------------|
 | `npm start` | Run production server (requires build) |
 | `npm run dev` | Start development server with hot-reload |
+| `npm run dev:render-parity` | Generate Prisma client, apply committed migrations, then start dev server |
 | `npm run build` | Compile TypeScript to JavaScript |
 | `npm test` | Run Jest test suite |
 | `npm run test:coverage` | Run Jest with coverage reporting and thresholds |
 | `npm run test:unit:coverage` | Run unit tests with coverage reporting and thresholds |
 | `npm run test:watch` | Run tests in watch mode |
+| `npm run test:load` | Run repeatable load baselines for prediction throughput and websocket fanout (#21) |
 | `npm run ci` | Run lint, build, unit coverage, and integration tests |
 | `npm run prisma:generate` | Generate Prisma client |
 | `npm run prisma:migrate` | Run database migrations |
+| `npm run prisma:migrate:deploy` | Apply committed migrations without creating new migration files |
+| `npm run db:prepare` | Run Prisma generate and migrate deploy |
 | `npm run docs:openapi` | Generate OpenAPI JSON spec to `docs/openapi.json` |
 | `npm run docs:verify` | Regenerate OpenAPI and verify required paths are documented (CI gate) |
 | `npm run docs:postman` | Export Postman collection |

@@ -1,3 +1,12 @@
+// Enforce Node.js 22+ runtime requirement at startup before loading any modules
+const nodeMajorVersion = parseInt(process.versions.node.split('.')[0], 10);
+if (nodeMajorVersion < 22) {
+  console.error(`🔥 CRITICAL ERROR: Application startup failed.`);
+  console.error(`Node.js v22.x or higher is required. You are running v${process.version}.`);
+  console.error(`Please upgrade Node.js to avoid local vs Render mismatches.`);
+  process.exit(1);
+}
+
 import express, { Express, Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
@@ -119,7 +128,7 @@ export function createApp(): Express {
       cors({
          origin: getHttpCorsOrigins(),
          methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-         allowedHeaders: ['Content-Type', 'Authorization'],
+         allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
          credentials: true,
       })
    );
@@ -301,8 +310,13 @@ export async function startServer(app: Express): Promise<ServerHandle> {
 
    if (apiOnly) {
       logger.info(
-         'API_ONLY=true: skipping oracle polling, schedulers, and WebSocket price ticker'
+         'API_ONLY=true: skipping oracle polling, round scheduler, and WebSocket price ticker. Outbox poller and retention jobs still run.'
       );
+      // The general scheduler (outbox poller, notification cleanup, retention)
+      // must run even in API_ONLY mode so outbox events written by this process
+      // are dispatched. Only oracle polling, round scheduling, and the price
+      // ticker are skipped.
+      schedulerService.start();
    } else {
       // Start Oracle Polling
       priceOracle.startPolling();
@@ -327,9 +341,10 @@ export async function startServer(app: Express): Promise<ServerHandle> {
       }
       if (!apiOnly) {
          priceOracle.stopPolling();
-         schedulerService.stop();
          roundSchedulerService.stop();
       }
+      // Always stop the general scheduler (outbox poller, cleanup jobs)
+      schedulerService.stop();
       httpServer.close();
       await prisma.$disconnect();
       logger.info('Shutdown complete');

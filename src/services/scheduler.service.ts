@@ -7,6 +7,10 @@ import logger from '../utils/logger';
 import { withDistributedLock } from '../utils/distributed-lock';
 import { prisma } from '../lib/prisma';
 import { RoundLifecycleOutcome } from '../types/round.types';
+import {
+   schedulerItemsProcessedTotal,
+   schedulerRunsTotal,
+} from '../metrics/application.metrics';
 
 class SchedulerService {
    private cronTasks: ScheduledTask[] = [];
@@ -49,6 +53,27 @@ class SchedulerService {
       this.cronTasks.push(
          cron.schedule('0 3 * * *', async () => {
             await this.runRetentionPolicies();
+         })
+      );
+
+      // Outbox poller — runs every OUTBOX_POLL_INTERVAL_SECONDS (default 10s).
+      // Dispatches PENDING outbox events written atomically with business
+      // transactions (Issue #18). Runs regardless of API_ONLY mode because
+      // the outbox must drain even in split-deployment setups.
+      const outboxIntervalSeconds = getOutboxPollIntervalSeconds();
+      const outboxCron = `*/${outboxIntervalSeconds} * * * * *`;
+      logger.info(`Starting outbox poller (interval: ${outboxIntervalSeconds}s)`);
+      this.cronTasks.push(
+         cron.schedule(outboxCron, async () => {
+            await this.pollOutbox();
+         })
+      );
+
+      // Outbox cleanup — runs daily at 3:30 AM alongside retention jobs.
+      logger.info('Starting outbox cleanup scheduler (daily at 3:30 AM)');
+      this.cronTasks.push(
+         cron.schedule('30 3 * * *', async () => {
+            await this.cleanupOutbox();
          })
       );
 
@@ -125,6 +150,10 @@ class SchedulerService {
          });
 
          if (expiredRounds.length === 0) {
+            schedulerRunsTotal.inc({
+               job: 'auto_resolve_rounds',
+               outcome: 'no_op',
+            });
             return;
          }
 
@@ -137,6 +166,10 @@ class SchedulerService {
             logger.warn(
                'Cannot auto-resolve rounds: Invalid price from oracle'
             );
+            schedulerRunsTotal.inc({
+               job: 'auto_resolve_rounds',
+               outcome: 'skipped',
+            });
             return;
          }
 
@@ -144,6 +177,10 @@ class SchedulerService {
             logger.warn(
                'Cannot auto-resolve rounds: Oracle price data is stale'
             );
+            schedulerRunsTotal.inc({
+               job: 'auto_resolve_rounds',
+               outcome: 'skipped',
+            });
             return;
          }
 
@@ -159,6 +196,10 @@ class SchedulerService {
                   logger.warn(
                      `Auto-resolution skipped for round ${round.id}: empty result`
                   );
+                  schedulerItemsProcessedTotal.inc({
+                     job: 'auto_resolve_rounds',
+                     outcome: 'skipped',
+                  });
                   continue;
                }
 
@@ -166,17 +207,37 @@ class SchedulerService {
                   logger.info(
                      `Auto-resolved round ${round.id} with price ${currentPrice.toString()}`
                   );
+                  schedulerItemsProcessedTotal.inc({
+                     job: 'auto_resolve_rounds',
+                     outcome: 'success',
+                  });
                } else if (
                   result.outcome === RoundLifecycleOutcome.ALREADY_RESOLVED
                ) {
                   logger.info(`Round ${round.id} was already resolved`);
+                  schedulerItemsProcessedTotal.inc({
+                     job: 'auto_resolve_rounds',
+                     outcome: 'no_op',
+                  });
                }
             } catch (error) {
                logger.error(`Failed to auto-resolve round ${round.id}:`, error);
+               schedulerItemsProcessedTotal.inc({
+                  job: 'auto_resolve_rounds',
+                  outcome: 'failure',
+               });
             }
          }
+         schedulerRunsTotal.inc({
+            job: 'auto_resolve_rounds',
+            outcome: 'success',
+         });
       } catch (error) {
          logger.error('Error in auto-resolution scheduler:', error);
+         schedulerRunsTotal.inc({
+            job: 'auto_resolve_rounds',
+            outcome: 'failure',
+         });
       }
    }
 
@@ -208,8 +269,20 @@ class SchedulerService {
          logger.info(
             `Notification cleanup completed: deleted ${deletedCount} notification(s) older than ${retentionDays} day(s)`
          );
+         schedulerItemsProcessedTotal.inc(
+            { job: 'notification_cleanup', outcome: 'success' },
+            deletedCount
+         );
+         schedulerRunsTotal.inc({
+            job: 'notification_cleanup',
+            outcome: 'success',
+         });
       } catch (error) {
          logger.error('Error in notification cleanup scheduler:', error);
+         schedulerRunsTotal.inc({
+            job: 'notification_cleanup',
+            outcome: 'failure',
+         });
       }
    }
 
@@ -241,8 +314,87 @@ class SchedulerService {
             .join(', ');
 
          logger.info(`Retention policy execution completed: ${summary}`);
+         for (const result of results) {
+            schedulerItemsProcessedTotal.inc(
+               { job: 'retention_policies', outcome: 'success' },
+               result.deletedCount
+            );
+         }
+         schedulerRunsTotal.inc({
+            job: 'retention_policies',
+            outcome: 'success',
+         });
       } catch (error) {
          logger.error('Error in retention policy scheduler:', error);
+         schedulerRunsTotal.inc({
+            job: 'retention_policies',
+            outcome: 'failure',
+         });
+      }
+   }
+
+   /**
+    * Build the dispatch handlers used by the outbox poller.
+    * Kept here (not in outbox.service) to avoid a circular import:
+    * outbox.service → notification.service → (no cycle)
+    * outbox.service → websocket.service → (no cycle)
+    * scheduler.service already imports both, so wiring happens here.
+    */
+   private buildOutboxHandlers(): OutboxDispatchHandlers {
+      return {
+         notificationCreate: async (payload) => {
+            return notificationService.createNotificationForRetry(payload);
+         },
+         websocketEmit: ({ eventName, room, data }) => {
+            websocketService.replayEmit(eventName, { room, data });
+         },
+      };
+   }
+
+   /**
+    * Poll the outbox for PENDING events and dispatch them.
+    * Protected by a distributed lock so only one instance runs per interval.
+    * @visibleForTesting
+    */
+   async pollOutbox(): Promise<void> {
+      await withDistributedLock(
+         'outbox-poll',
+         () => this.pollOutboxInternal(),
+         { ttlSeconds: getOutboxPollIntervalSeconds() + 5 }
+      );
+   }
+
+   private async pollOutboxInternal(): Promise<void> {
+      try {
+         const result = await outboxService.processOutbox(this.buildOutboxHandlers());
+         if (result.processed > 0 || result.failed > 0) {
+            logger.info('Outbox poll completed', result);
+         }
+      } catch (error) {
+         logger.error('Error in outbox poller:', error);
+      }
+   }
+
+   /**
+    * Delete old PROCESSED outbox rows.
+    * @visibleForTesting
+    */
+   async cleanupOutbox(): Promise<void> {
+      await withDistributedLock(
+         'outbox-cleanup',
+         () => this.cleanupOutboxInternal(),
+         { ttlSeconds: 60 }
+      );
+   }
+
+   private async cleanupOutboxInternal(): Promise<void> {
+      try {
+         const count = await outboxService.cleanupProcessed();
+         if (count > 0) {
+            logger.info(`Outbox cleanup: removed ${count} processed event(s)`);
+         }
+      } catch (error) {
+         logger.error('Error in outbox cleanup scheduler:', error);
       }
    }
 }
