@@ -3,9 +3,16 @@ import { prisma } from "../lib/prisma";
 import { getJsonFromCache, setJsonToCache } from "../lib/redis";
 import {
   LeaderboardEntry,
+  LeaderboardCursorResponse,
   LeaderboardResponse,
 } from "../types/leaderboard.types";
 import { toDecimal, toNumber } from "../utils/decimal.util";
+import {
+  buildCursorMeta,
+  buildOffsetMeta,
+  decodeCursor,
+  trimSentinel,
+} from "../utils/pagination.util";
 
 const LEADERBOARD_CACHE_NAMESPACE = "leaderboard";
 const LEADERBOARD_CACHE_TTL_SECONDS = parseInt(
@@ -21,16 +28,16 @@ const LEADERBOARD_CACHE_TTL_SECONDS = parseInt(
  * - TTL: `LEADERBOARD_CACHE_TTL_SECONDS` (seconds)
  */
 
-// Get leaderboard with pagination
+// ---------------------------------------------------------------------------
+// Offset/limit leaderboard (existing behaviour, now with pagination meta)
+// ---------------------------------------------------------------------------
 
 export async function getLeaderboard(
   limit: number = 100,
   offset: number = 0,
   userId?: string,
 ): Promise<LeaderboardResponse> {
-  const rawKey = `limit=${limit}:offset=${offset}:user=${
-    userId ? userId : "anon"
-  }`;
+  const rawKey = `limit=${limit}:offset=${offset}:user=${userId ?? "anon"}`;
 
   type LeaderboardCachePayload = Omit<LeaderboardResponse, "lastUpdated">;
 
@@ -110,6 +117,7 @@ export async function getLeaderboard(
     leaderboard,
     userPosition,
     totalUsers,
+    pagination: buildOffsetMeta(limit, offset, totalUsers),
   };
 
   await setJsonToCache(
@@ -122,6 +130,105 @@ export async function getLeaderboard(
   return {
     ...payload,
     lastUpdated: new Date().toISOString(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Cursor-based leaderboard
+// ---------------------------------------------------------------------------
+
+/**
+ * Cursor encodes `{ totalEarnings, userId }` of the last entry on the
+ * previous page. Using both fields handles ties in totalEarnings correctly.
+ *
+ * @param limit  - page size (1–500)
+ * @param cursor - opaque cursor from a previous response (optional)
+ * @param userId - authenticated user id for userPosition lookup (optional)
+ */
+export async function getLeaderboardCursor(
+  limit: number = 100,
+  cursor?: string,
+  userId?: string,
+): Promise<LeaderboardCursorResponse> {
+  const decoded = decodeCursor<{ totalEarnings: string; userId: string }>(cursor);
+
+  // Fetch limit+1 rows for the sentinel trick
+  const userStats = await prisma.userStats.findMany({
+    take: limit + 1,
+    orderBy: [{ totalEarnings: "desc" }, { userId: "asc" }],
+    ...(decoded
+      ? {
+          cursor: { userId: decoded.userId },
+          skip: 1,
+        }
+      : {}),
+    include: {
+      user: {
+        select: {
+          id: true,
+          walletAddress: true,
+        },
+      },
+    },
+  });
+
+  // We need the global offset of the first row on this page to compute ranks.
+  // Count how many rows have higher earnings than the cursor row.
+  let rankOffset = 0;
+  if (decoded) {
+    rankOffset = await prisma.userStats.count({
+      where: {
+        totalEarnings: { gt: decoded.totalEarnings },
+      },
+    });
+  }
+
+  const pagination = buildCursorMeta(limit, userStats, (stat) => ({
+    totalEarnings: stat.totalEarnings.toString(),
+    userId: stat.userId,
+  }));
+
+  const pageStats = trimSentinel(userStats, limit);
+
+  const leaderboard: LeaderboardEntry[] = pageStats.map((stat, index) => ({
+    rank: rankOffset + index + 1,
+    userId: stat.user.id,
+    walletAddress: maskWalletAddress(stat.user.walletAddress),
+    totalEarnings: toNumber(stat.totalEarnings),
+    totalPredictions: stat.totalPredictions,
+    accuracy: calculateAccuracy(stat.correctPredictions, stat.totalPredictions),
+    modeStats: {
+      upDown: {
+        wins: stat.upDownWins,
+        losses: stat.upDownLosses,
+        earnings: toNumber(stat.upDownEarnings),
+        accuracy: calculateAccuracy(
+          stat.upDownWins,
+          stat.upDownWins + stat.upDownLosses,
+        ),
+      },
+      legends: {
+        wins: stat.legendsWins,
+        losses: stat.legendsLosses,
+        earnings: toNumber(stat.legendsEarnings),
+        accuracy: calculateAccuracy(
+          stat.legendsWins,
+          stat.legendsWins + stat.legendsLosses,
+        ),
+      },
+    },
+  }));
+
+  let userPosition: LeaderboardEntry | undefined;
+  if (userId) {
+    userPosition = await getUserPosition(userId);
+  }
+
+  return {
+    leaderboard,
+    userPosition,
+    lastUpdated: new Date().toISOString(),
+    pagination,
   };
 }
 
