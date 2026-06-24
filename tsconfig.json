@@ -19,6 +19,7 @@
     "src/routes/health.ts",
     "src/routes/stats.ts",
     "src/routes/rounds.ts",
+    "src/routes/leaderboard.ts",
     "src/tests/hackathon.test.ts"
   ]
 }

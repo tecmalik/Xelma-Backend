@@ -6,6 +6,7 @@ import routes from './routes';
 import healthRoutes from './routes/health';
 import statsRoutes from './routes/stats';
 import roundsRoutes from './routes/rounds';
+import leaderboardRoutes from './routes/leaderboard';
 import { apiRateLimiter, writeRateLimiter } from './middleware/rateLimiter';
 
 const app: Application = express();
@@ -20,6 +21,7 @@ app.use('/api', writeRateLimiter);
 app.use('/api', healthRoutes);
 app.use('/api', statsRoutes);
 app.use('/api/rounds', roundsRoutes);
+app.use('/api/leaderboard', leaderboardRoutes);
 app.use('/api', routes);
 
 export default app;
