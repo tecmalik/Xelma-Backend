@@ -4,6 +4,7 @@ import { authenticateUser, AuthenticatedRequest } from "../middleware/auth.middl
 import { validate } from "../middleware/validate.middleware";
 import { updateProfileSchema } from "../schemas/user.schema";
 import { NotFoundError } from "../utils/errors";
+import sorobanService from "../services/soroban.service";
 
 const router = Router();
 
@@ -115,6 +116,53 @@ router.get("/stats", authenticateUser, (async (req: AuthenticatedRequest, res: R
     next(error);
   }
 }) as any);
+
+/**
+ * GET /api/user/:address/stats
+ * Returns on-chain user stats and pending winnings from the Soroban contract.
+ * Public endpoint — no authentication required.
+ */
+router.get(
+  "/:address/stats",
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { address } = req.params;
+
+      const [contractStats, pendingWinnings] = await Promise.all([
+        sorobanService.getUserStats(address),
+        sorobanService.getPendingWinnings(address),
+      ]);
+
+      if (!contractStats) {
+        return res.json({
+          success: true,
+          stats: {
+            totalWins: 0,
+            totalLosses: 0,
+            bestStreak: 0,
+            currentStreak: 0,
+            pendingWinnings: "0",
+            isRegistered: false,
+          },
+        });
+      }
+
+      return res.json({
+        success: true,
+        stats: {
+          totalWins: contractStats.total_wins,
+          totalLosses: contractStats.total_losses,
+          bestStreak: contractStats.best_streak,
+          currentStreak: contractStats.current_streak,
+          pendingWinnings: pendingWinnings.toString(),
+          isRegistered: contractStats.total_wins > 0 || contractStats.total_losses > 0,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
 
 /**
  * PATCH /api/user/profile

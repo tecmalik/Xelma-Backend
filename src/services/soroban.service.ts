@@ -1,5 +1,5 @@
 import { Keypair, Networks, Transaction } from "@stellar/stellar-sdk";
-import type { Client as XelmaClient, BetSide, OraclePayload, RoundMode } from "@tevalabs/xelma-bindings";
+import type { Client as XelmaClient, BetSide, OraclePayload, RoundMode, UserStats } from "@tevalabs/xelma-bindings";
 import logger from "../utils/logger";
 import { toDecimal } from "../utils/decimal.util";
 import { withTimeout, TimeoutResult } from "../utils/timeout-wrapper";
@@ -445,6 +445,78 @@ export class SorobanService {
         timedOut: result.timedOut,
       });
       return 0;
+    }
+
+    return result.data!;
+  }
+
+  /**
+   * Gets user stats from Soroban (read-only simulation).
+   * Returns win/loss counts and streak data from the contract.
+   *
+   * Timeout: 10s for read-only queries
+   */
+  async getUserStats(userAddress: string): Promise<UserStats | null> {
+    await this.ready;
+    if (!this.initialized) return null;
+
+    const result = await this.callWithBreaker("sorobanGetUserStats", () =>
+      withTimeout(
+        async () => {
+          const tx = await this.client!.get_user_stats({ user: userAddress });
+          return tx.result;
+        },
+        {
+          timeoutMs: 10000,
+          operationName: 'sorobanGetUserStats',
+          retries: 1,
+        }
+      ),
+      null,
+    );
+
+    if (!result.success) {
+      logger.warn("Failed to get user stats from Soroban", {
+        error: result.error?.message,
+        timedOut: result.timedOut,
+      });
+      return null;
+    }
+
+    return result.data;
+  }
+
+  /**
+   * Gets pending (claimable) winnings from Soroban (read-only simulation).
+   * Returns the amount in stroops (1 XLM = 10^7 stroops).
+   *
+   * Timeout: 10s for read-only queries
+   */
+  async getPendingWinnings(userAddress: string): Promise<bigint> {
+    await this.ready;
+    if (!this.initialized) return BigInt(0);
+
+    const result = await this.callWithBreaker("sorobanGetPendingWinnings", () =>
+      withTimeout(
+        async () => {
+          const tx = await this.client!.get_pending_winnings({ user: userAddress });
+          return tx.result;
+        },
+        {
+          timeoutMs: 10000,
+          operationName: 'sorobanGetPendingWinnings',
+          retries: 1,
+        }
+      ),
+      BigInt(0),
+    );
+
+    if (!result.success) {
+      logger.warn("Failed to get pending winnings from Soroban", {
+        error: result.error?.message,
+        timedOut: result.timedOut,
+      });
+      return BigInt(0);
     }
 
     return result.data!;
