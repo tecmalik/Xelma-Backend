@@ -15,6 +15,7 @@ jest.mock("../services/soroban.service", () => {
 });
 
 const VALID_ADDRESS = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+const OTHER_ADDRESS = "GBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBZ";
 
 describe("Bets Routes", () => {
   let app: Express;
@@ -34,6 +35,7 @@ describe("Bets Routes", () => {
       process.env.BET_STUB_MODE = "true";
       const res = await request(app)
         .post("/api/bets/up-down")
+        .set("Authorization", `Bearer ${token}`)
         .send({ address: VALID_ADDRESS, amount: 10, side: "UP" });
 
       expect(res.status).toBe(200);
@@ -78,8 +80,10 @@ describe("Bets Routes", () => {
     });
 
     it("returns 400 when required fields are missing", async () => {
+      const token = generateToken("user-1", VALID_ADDRESS, UserRole.USER);
       const res = await request(app)
         .post("/api/bets/up-down")
+        .set("Authorization", `Bearer ${token}`)
         .send({ address: VALID_ADDRESS, amount: 10 });
 
       expect(res.status).toBe(400);
@@ -93,6 +97,7 @@ describe("Bets Routes", () => {
       process.env.BET_STUB_MODE = "true";
       const res = await request(app)
         .post("/api/bets/precision")
+        .set("Authorization", `Bearer ${token}`)
         .send({ address: VALID_ADDRESS, amount: 5, predictedPrice: 0.12 });
 
       expect(res.status).toBe(200);
@@ -137,8 +142,10 @@ describe("Bets Routes", () => {
     });
 
     it("returns 400 when predictedPrice is missing", async () => {
+      const token = generateToken("user-1", VALID_ADDRESS, UserRole.USER);
       const res = await request(app)
         .post("/api/bets/precision")
+        .set("Authorization", `Bearer ${token}`)
         .send({ address: VALID_ADDRESS, amount: 5 });
 
       expect(res.status).toBe(400);

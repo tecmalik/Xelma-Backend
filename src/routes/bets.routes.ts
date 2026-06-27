@@ -1,5 +1,6 @@
 import { Router, Response, NextFunction } from "express";
 import { validate } from "../middleware/validate.middleware";
+import { verifyStellarAuth, AuthenticatedRequest } from "../middleware/auth.middleware";
 import { upDownBetSchema, precisionBetSchema } from "../schemas/bets.schema";
 import betService from "../services/bet.service";
 
@@ -30,6 +31,7 @@ const router = Router();
  */
 router.post(
   "/up-down",
+  verifyStellarAuth,
   validate(upDownBetSchema),
   async (req, res: Response, next: NextFunction) => {
     try {
@@ -75,6 +77,7 @@ router.post(
  */
 router.post(
   "/precision",
+  verifyStellarAuth,
   validate(precisionBetSchema),
   async (req, res: Response, next: NextFunction) => {
     try {
