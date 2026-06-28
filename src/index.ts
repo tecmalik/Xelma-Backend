@@ -29,6 +29,7 @@ import oracleService from './services/oracle.service';
 import logger from './utils/logger';
 import { validateVendoredBindings } from './utils/bindings-validator';
 import { errorHandler } from './middleware/errorHandler.middleware';
+import config from './config';
 import { metricsMiddleware } from './middleware/metrics.middleware';
 import { requestIdMiddleware } from './middleware/requestId.middleware';
 import metricsRoutes from './routes/metrics.routes';
@@ -36,13 +37,16 @@ import adminMetricsRoutes from './routes/admin-metrics.routes';
 import errorsRoutes from './routes/errors.routes';
 import corsDiagnosticsRoutes from './routes/admin-cors-diagnostics.routes';
 import deadLetterRoutes from './routes/admin-dead-letter.routes';
+import healthRoutes from './routes/health';
 import chatRoutes from './routes/chat.routes';
 import tournamentsRoutes from './routes/tournaments.routes';
+import pricesRoutes from './routes/prices';
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './docs/openapi';
 import { initializeSocket } from './socket';
 import { prisma } from './lib/prisma';
 import path from 'path';
+import { Router } from 'express';
 
 const envFile = process.env.NODE_ENV === 'test' ? '.env.test' : '.env';
 dotenv.config({ path: path.resolve(process.cwd(), envFile), override: false });
@@ -115,6 +119,7 @@ assertPreflightOrExit();
 // Execute validation immediately
 validateEnv();
 logBindingsValidation();
+logger.info(`Active DATA_MODE=${config.app.dataMode}`);
 
 /**
  * Create and configure the Express app without starting any background
@@ -152,21 +157,50 @@ export function createApp(): Express {
       next();
    });
 
-   // API Routes
-   app.use('/api/auth', authRoutes);
-   app.use('/api/user', userRoutes);
-   app.use('/api/rounds', roundsRoutes);
-   app.use('/api/bets', betsRoutes);
-   app.use('/api/predictions', predictionsRoutes);
-   app.use('/api/education', educationRoutes);
-   app.use('/api/leaderboard', leaderboardRoutes);
-   app.use('/api/chat', chatRoutes);
-   app.use('/api/notifications', notificationsRoutes);
-   app.use('/api/tournaments', tournamentsRoutes);
-   app.use('/api/admin/metrics', adminMetricsRoutes);
-   app.use('/api/errors', errorsRoutes);
-   app.use('/api/admin/cors-diagnostics', corsDiagnosticsRoutes);
-   app.use('/api/admin/dead-letter', deadLetterRoutes);
+    // API Routes
+    app.use('/api/auth', authRoutes);
+    app.use('/api/user', userRoutes);
+    app.use('/api/rounds', roundsRoutes);
+    app.use('/api/bets', betsRoutes);
+    app.use('/api/predictions', predictionsRoutes);
+    app.use('/api/education', educationRoutes);
+    app.use('/api/leaderboard', leaderboardRoutes);
+    app.use('/api/chat', chatRoutes);
+    app.use('/api/notifications', notificationsRoutes);
+    app.use('/api/tournaments', tournamentsRoutes);
+    app.use('/api/admin/metrics', adminMetricsRoutes);
+    app.use('/api/errors', errorsRoutes);
+    app.use('/api/admin/cors-diagnostics', corsDiagnosticsRoutes);
+     app.use('/api/admin/dead-letter', deadLetterRoutes);
+     app.use('/health', healthRoutes);
+
+     // Versioned API v1 router (same routes, under /api/v1 prefix)
+    const v1Router = Router();
+    v1Router.use('/auth', authRoutes);
+    v1Router.use('/user', userRoutes);
+    v1Router.use('/rounds', roundsRoutes);
+    v1Router.use('/bets', betsRoutes);
+    v1Router.use('/predictions', predictionsRoutes);
+    v1Router.use('/education', educationRoutes);
+    v1Router.use('/leaderboard', leaderboardRoutes);
+    v1Router.use('/chat', chatRoutes);
+    v1Router.use('/notifications', notificationsRoutes);
+    v1Router.use('/tournaments', tournamentsRoutes);
+    v1Router.use('/admin/metrics', adminMetricsRoutes);
+    v1Router.use('/errors', errorsRoutes);
+    v1Router.use('/admin/cors-diagnostics', corsDiagnosticsRoutes);
+    v1Router.use('/admin/dead-letter', deadLetterRoutes);
+    app.use('/api/v1', v1Router);
+
+    // Deprecation headers for legacy unversioned /api/* paths
+    app.use('/api', (req, res, next) => {
+       if (!req.path.startsWith('/v1')) {
+          res.setHeader('Deprecation', 'true');
+          res.setHeader('Sunset', 'Sat, 01 Jan 2027 00:00:00 GMT');
+          res.setHeader('Link', `</api/v1${req.path}>; rel="successor-version"`);
+       }
+       next();
+    });
 
    // Prometheus metrics endpoint
    app.use('/metrics', metricsRoutes);
@@ -191,69 +225,9 @@ export function createApp(): Express {
          timestamp: new Date().toISOString(),
          status: 'OK',
       });
-   });
+    });
 
-   // Health check endpoint
-   app.get('/health', async (req: Request, res: Response) => {
-      const startTime = Date.now();
-      let dbStatus = 'unhealthy';
-      let dbDurationMs = 0;
-      let overallStatus = 'healthy';
-
-      // Check database connectivity with bounded timeout
-      try {
-         const dbCheckStart = Date.now();
-         await Promise.race([
-            prisma.$queryRaw`SELECT 1`,
-            new Promise((_, reject) =>
-               setTimeout(
-                  () => reject(new Error('DB health check timeout')),
-                  5000
-               )
-            ),
-         ]);
-         dbStatus = 'healthy';
-         dbDurationMs = Date.now() - dbCheckStart;
-         logger.debug('Database health check passed', { dbDurationMs });
-      } catch (dbError: any) {
-         dbStatus = 'unhealthy';
-         dbDurationMs = Date.now() - startTime;
-         overallStatus = 'degraded';
-         logger.warn('Database health check failed', {
-            error: dbError?.message || 'Unknown error',
-            dbDurationMs,
-         });
-      }
-
-      // Check Soroban service health
-      let sorobanHealth;
-      try {
-         sorobanHealth = await sorobanService.getHealth();
-      } catch (error: any) {
-         logger.warn('Soroban health check failed', { error: error?.message });
-         sorobanHealth = { initialized: false, error: 'Health check failed' };
-      }
-
-      const responseCode = overallStatus === 'healthy' ? 200 : 503;
-      const totalDurationMs = Date.now() - startTime;
-
-      res.status(responseCode).json({
-         status: overallStatus,
-         uptime: process.uptime(),
-         timestamp: new Date().toISOString(),
-         durationMs: totalDurationMs,
-         services: {
-            soroban: sorobanHealth,
-            database: {
-               status: dbStatus,
-               durationMs: dbDurationMs,
-               timeout: 5000,
-            },
-         },
-      });
-   });
-
-   // Price Oracle endpoint (returns price_usd as a precise decimal string)
+    // Price Oracle endpoint (returns price_usd as a precise decimal string)
    app.get('/api/price', (req: Request, res: Response) => {
       const price = priceOracle.getPriceString();
       const lastUpdatedAt = priceOracle.getLastUpdatedAt();
@@ -261,7 +235,9 @@ export function createApp(): Express {
          asset: 'XLM',
          price_usd: price,
          stale: priceOracle.isStale(),
+         provider: priceOracle.getLastProvider(),
          lastUpdatedAt: lastUpdatedAt?.toISOString() ?? null,
+         source: priceOracle.getActiveSource(),
          timestamp: new Date().toISOString(),
       });
    });

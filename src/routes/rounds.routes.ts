@@ -2,11 +2,13 @@ import { Router, Request, Response, NextFunction } from 'express';
 import roundService from '../services/round.service';
 import resolutionService from '../services/resolution.service';
 import { requireAdmin, requireOracle, AuthenticatedRequest } from '../middleware/auth.middleware';
-import { toDecimal } from '../utils/decimal.util';
+import { toDecimal, toDecimalString } from '../utils/decimal.util';
 import { adminRoundRateLimiter, oracleResolveRateLimiter } from '../middleware/rateLimiter.middleware';
 import { validate } from '../middleware/validate.middleware';
 import { startRoundSchema, resolveRoundSchema } from '../schemas/rounds.schema';
 import { NotFoundError } from '../utils/errors';
+import config from '../config';
+import simulationService from '../services/simulation.service';
 
 const router = Router();
 
@@ -127,7 +129,7 @@ router.post('/start', requireAdmin, adminRoundRateLimiter, validate(startRoundSc
                 status: round.status,
                 startTime: round.startTime,
                 endTime: round.endTime,
-                startPrice: round.startPrice,
+                startPrice: toDecimalString(round.startPrice),
                 sorobanRoundId: round.sorobanRoundId,
                 isSoroban: round.isSoroban,
                 priceRanges: round.priceRanges,
@@ -168,10 +170,18 @@ router.get('/active', async (req: Request, res: Response, next: NextFunction) =>
     try {
         const { source, rounds } = await roundService.getActiveRoundsWithFallback();
 
+        const serializedRounds = rounds.map((round: any) => ({
+            ...round,
+            startPrice: toDecimalString(round.startPrice),
+            endPrice: round.endPrice !== null && round.endPrice !== undefined ? toDecimalString(round.endPrice) : null,
+            poolUp: toDecimalString(round.poolUp),
+            poolDown: toDecimalString(round.poolDown),
+        }));
+
         res.json({
             success: true,
             source,
-            rounds,
+            rounds: serializedRounds,
         });
     } catch (error) {
         next(error);
@@ -223,9 +233,20 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
             return next(new NotFoundError('Round not found'));
         }
 
-        res.json({
+         res.json({
             success: true,
-            round,
+            round: {
+                ...round,
+                startPrice: toDecimalString(round.startPrice),
+                endPrice: round.endPrice !== null && round.endPrice !== undefined ? toDecimalString(round.endPrice) : null,
+                poolUp: toDecimalString(round.poolUp),
+                poolDown: toDecimalString(round.poolDown),
+                predictions: round.predictions?.map((p: any) => ({
+                    ...p,
+                    amount: toDecimalString(p.amount),
+                    payout: p.payout !== null && p.payout !== undefined ? toDecimalString(p.payout) : null,
+                })),
+            },
         });
     } catch (error) {
         next(error);
@@ -324,8 +345,8 @@ router.post('/:id/resolve', requireOracle, oracleResolveRateLimiter, validate(re
             round: {
                 id: round.id,
                 status: round.status,
-                startPrice: round.startPrice,
-                endPrice: round.endPrice,
+                startPrice: toDecimalString(round.startPrice),
+                endPrice: round.endPrice !== null && round.endPrice !== undefined ? toDecimalString(round.endPrice) : null,
                 resolvedAt: round.resolvedAt,
                 predictions: round.predictions ? round.predictions.length : 0,
                 winners: round.predictions ? round.predictions.filter((p: any) => p.won === true).length : 0,
@@ -335,5 +356,66 @@ router.post('/:id/resolve', requireOracle, oracleResolveRateLimiter, validate(re
         next(error);
     }
 }) as any);
+
+/**
+ * @swagger
+ * /api/rounds/{id}/simulate:
+ *   post:
+ *     summary: Simulate a round resolution (Non-Production QA Endpoint)
+ *     description: Simulates payout distribution for frontend QA without placing real bets or mutating the round status. Disabled in production unless ENABLE_SIMULATION=true.
+ *     tags: [rounds]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *         description: Round ID
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               finalPrice: { type: number, description: Simulated final price }
+ *             required: [finalPrice]
+ *     responses:
+ *       200:
+ *         description: Simulation results showing winners, losers, and payout mock
+ *       400:
+ *         description: Validation error
+ *       403:
+ *         description: Disabled in production
+ *       404:
+ *         description: Round not found
+ */
+router.post('/:id/simulate', async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        if (config.app.nodeEnv === 'production' && !config.app.enableSimulation) {
+            return res.status(403).json({ success: false, error: 'Simulation disabled in production unless ENABLE_SIMULATION=true' });
+        }
+        
+        const { id } = req.params;
+        const { finalPrice } = req.body;
+        
+        if (finalPrice === undefined || finalPrice === null) {
+            return res.status(400).json({ success: false, error: 'finalPrice is required' });
+        }
+        
+        const result = await simulationService.simulateRound(id, finalPrice);
+        if (!result) {
+            return res.status(404).json({ success: false, error: 'Round not found' });
+        }
+        
+        res.json({
+            success: true,
+            roundId: id,
+            simulatedPrice: finalPrice,
+            ...result
+        });
+    } catch (error) {
+        next(error);
+    }
+});
 
 export default router;

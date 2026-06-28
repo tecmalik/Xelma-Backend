@@ -3,9 +3,10 @@ import { prisma } from "../lib/prisma";
 import { authenticateUser, AuthenticatedRequest } from "../middleware/auth.middleware";
 import { validate } from "../middleware/validate.middleware";
 import { updateProfileSchema } from "../schemas/user.schema";
-import { offsetPaginationSchema } from "../schemas/pagination.schema";
+import { unifiedPaginationSchema, UnifiedPaginationParams } from "../schemas/pagination.schema";
 import { NotFoundError } from "../utils/errors";
 import sorobanService from "../services/soroban.service";
+import { toDecimalString } from "../utils/decimal.util";
 
 const router = Router();
 
@@ -48,7 +49,7 @@ router.get(
         preferences: user.preferences,
         streak: user.streak,
         lastLoginAt: user.lastLoginAt,
-        balance: user.virtualBalance,
+        balance: toDecimalString(user.virtualBalance),
       };
 
       return res.json({
@@ -81,7 +82,7 @@ router.get(
 
       return res.json({
         success: true,
-        balance: user.virtualBalance,
+        balance: toDecimalString(user.virtualBalance),
       });
     } catch (error) {
       next(error);
@@ -103,15 +104,29 @@ router.get("/stats", authenticateUser, (async (req: AuthenticatedRequest, res: R
 
     return res.json({
       success: true,
-      stats: stats || {
-        totalPredictions: 0,
-        correctPredictions: 0,
-        totalEarnings: 0,
-        upDownWins: 0,
-        upDownLosses: 0,
-        legendsWins: 0,
-        legendsLosses: 0,
-      },
+      stats: stats
+        ? {
+            totalPredictions: stats.totalPredictions,
+            correctPredictions: stats.correctPredictions,
+            totalEarnings: toDecimalString(stats.totalEarnings),
+            upDownWins: stats.upDownWins,
+            upDownLosses: stats.upDownLosses,
+            upDownEarnings: toDecimalString(stats.upDownEarnings),
+            legendsWins: stats.legendsWins,
+            legendsLosses: stats.legendsLosses,
+            legendsEarnings: toDecimalString(stats.legendsEarnings),
+          }
+        : {
+            totalPredictions: 0,
+            correctPredictions: 0,
+            totalEarnings: "0",
+            upDownWins: 0,
+            upDownLosses: 0,
+            upDownEarnings: "0",
+            legendsWins: 0,
+            legendsLosses: 0,
+            legendsEarnings: "0",
+          },
     });
   } catch (error) {
     next(error);
@@ -228,9 +243,14 @@ router.get(
         prisma.transaction.count({ where: { userId } }),
       ]);
 
+      const serializedTransactions = transactions.map((tx: any) => ({
+        ...tx,
+        amount: toDecimalString(tx.amount),
+      }));
+
       return res.json({
         success: true,
-        data: transactions,
+        data: serializedTransactions,
         pagination: {
           page,
           limit,
@@ -248,75 +268,146 @@ router.get(
  * GET /api/user/:address/history
  * Paginated bet (prediction) history for a Stellar address.
  * Public endpoint — no authentication required.
+ *
+ * Pagination modes
+ * ────────────────
+ * Cursor (preferred for large histories):
+ *   ?limit=20&cursor=<opaque-cursor>
+ *   Response includes `nextCursor`; use it as `cursor` in the next request.
+ *   Returns `nextCursor: null` on the last page.
+ *
+ * Offset (legacy, backward-compatible):
+ *   ?limit=20&offset=0
+ *   Returns `total` and `totalPages` for UI paginators.
+ *   Performance degrades for offsets > ~10 000 rows.
+ *
+ * Cursor mode is selected automatically when `cursor` is present in the query
+ * (even `cursor=""` keeps offset mode — only a non-empty string activates it).
  */
 router.get(
   "/:address/history",
-  validate(offsetPaginationSchema, "query"),
+  validate(unifiedPaginationSchema, "query"),
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const { address } = req.params;
-      const { limit, offset } = req.query as unknown as { limit: number; offset: number };
+      const { limit, offset, cursor } = req.query as unknown as UnifiedPaginationParams;
 
+      // Resolve the user record once — shared by both pagination modes.
       const user = await prisma.user.findUnique({
         where: { walletAddress: address },
         select: { id: true },
       });
 
+      // Unknown address → empty response (not a 404: the address may exist on-chain
+      // but have never placed a bet, and callers should not need to handle errors).
       if (!user) {
         return res.json({
           success: true,
           data: [],
-          pagination: { limit, offset, total: 0 },
+          ...(cursor
+            ? { nextCursor: null }
+            : { pagination: { limit, offset, total: 0, totalPages: 0 } }),
         });
       }
 
+      // ── Shared include shape ────────────────────────────────────────────────
+      const roundSelect = {
+        select: {
+          id: true,
+          mode: true,
+          startPrice: true,
+          endPrice: true,
+          status: true,
+          startTime: true,
+          endTime: true,
+          resolvedAt: true,
+        },
+      };
+
+      // ── Cursor-based path ────────────────────────────────────────────────────
+      if (cursor) {
+        // The cursor is a base64-encoded ISO timestamp (createdAt of the last
+        // record seen). We fetch limit + 1 rows to detect whether a next page
+        // exists without a separate COUNT query.
+        let cursorDate: Date | undefined;
+        try {
+          cursorDate = new Date(Buffer.from(cursor, "base64url").toString("utf8"));
+          if (isNaN(cursorDate.getTime())) throw new Error("invalid date");
+        } catch {
+          return res.status(400).json({
+            success: false,
+            error: "Invalid cursor. Use the nextCursor value returned by a previous response.",
+          });
+        }
+
+        const predictions = await prisma.prediction.findMany({
+          where: {
+            userId: user.id,
+            createdAt: { lt: cursorDate },
+          },
+          orderBy: { createdAt: "desc" },
+          take: limit + 1,          // fetch one extra to check for next page
+          include: { round: roundSelect },
+        });
+
+        const hasNextPage = predictions.length > limit;
+        const page = hasNextPage ? predictions.slice(0, limit) : predictions;
+
+        // Encode the createdAt of the last returned record as the next cursor.
+        const nextCursor = hasNextPage
+          ? Buffer.from(page[page.length - 1].createdAt.toISOString()).toString("base64url")
+          : null;
+
+        return res.json({
+          success: true,
+          data: page.map(mapPrediction),
+          nextCursor,
+        });
+      }
+
+      // ── Offset-based path (backward-compatible) ───────────────────────────
       const [predictions, total] = await prisma.$transaction([
         prisma.prediction.findMany({
           where: { userId: user.id },
           orderBy: { createdAt: "desc" },
           take: limit,
           skip: offset,
-          include: {
-            round: {
-              select: {
-                id: true,
-                mode: true,
-                startPrice: true,
-                endPrice: true,
-                status: true,
-                startTime: true,
-                endTime: true,
-                resolvedAt: true,
-              },
-            },
-          },
+          include: { round: roundSelect },
         }),
         prisma.prediction.count({ where: { userId: user.id } }),
       ]);
 
-      const history = predictions.map((p: any) => ({
-        roundId: p.roundId,
-        asset: "XLM",
-        mode: p.round.mode,
-        amount: p.amount,
-        side: p.side,
-        predictedPrice: p.priceRange,
-        result: p.won === null ? "PENDING" : p.won ? "WIN" : "LOSS",
-        payout: p.payout,
-        timestamp: p.createdAt,
-        roundStatus: p.round.status,
-      }));
-
       return res.json({
         success: true,
-        data: history,
-        pagination: { limit, offset, total },
+        data: predictions.map(mapPrediction),
+        pagination: {
+          limit,
+          offset,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
       });
     } catch (error) {
       next(error);
     }
   },
 );
+
+/** Maps a raw Prisma prediction + round to the public API shape. */
+function mapPrediction(p: any) {
+  return {
+    roundId: p.roundId,
+    asset: "XLM",
+    mode: p.round.mode,
+    amount: toDecimalString(p.amount),
+    side: p.side,
+    predictedPrice: p.priceRange,
+    result: p.won === null ? "PENDING" : p.won ? "WIN" : "LOSS",
+    payout: p.payout !== null && p.payout !== undefined ? toDecimalString(p.payout) : null,
+    timestamp: p.createdAt,
+    roundStatus: p.round.status,
+  };
+}
 
 /**
  * GET /api/user/:walletAddress/public-profile
