@@ -936,6 +936,72 @@ attempt.
 
 ---
 
+### Bet Endpoints
+
+#### Submit an UP/DOWN Bet
+
+```bash
+POST /api/bets/up-down
+Authorization: Bearer YOUR_JWT_TOKEN
+Content-Type: application/json
+Idempotency-Key: a5b7-c9d8-e2f4-77a8-33b2
+
+{
+  "address": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+  "amount": 10,
+  "side": "UP"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Bet recorded (stub)",
+  "state": "stub"
+}
+```
+
+#### Submit a Precision Bet
+
+```bash
+POST /api/bets/precision
+Authorization: Bearer YOUR_JWT_TOKEN
+Content-Type: application/json
+Idempotency-Key: a5b7-c9d8-e2f4-77a8-33b2
+
+{
+  "address": "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+  "amount": 5,
+  "predictedPrice": 0.12
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "Bet placed on-chain",
+  "state": "on-chain-success",
+  "txHash": "0x123..."
+}
+```
+
+#### Bet Creation Idempotency
+
+Both `/api/bets/up-down` and `/api/bets/precision` endpoints support safe client retries using the optional `Idempotency-Key` header.
+
+* **Idempotency-Key Header**: Optional. Standard string format (alphanumeric with hyphens/underscores, 8-255 characters).
+* **TTL (Time-To-Live)**: 24 hours. Stored idempotency records are kept for 24 hours (or as configured via `BET_IDEMPOTENCY_TTL_HOURS` environment variable) and then pruned by the daily scheduler.
+* **Retry Semantics**:
+  * **First Successful Request**: Performs the bet operation (either stub or submits on-chain) and caches the response.
+  * **Duplicate Request (Same Key & Body)**: Returns the original cached response with HTTP 200 without creating a duplicate bet or executing on-chain transactions again.
+  * **Mutation Check (Same Key, Different Body)**: Returns HTTP 409 Conflict with code `CONFLICT` and error code `IDEMPOTENCY_KEY_CONFLICT` to protect against unintentional reuse of keys across different operations.
+  * **Concurrency Protection**: Simultaneous concurrent requests with the identical key are coordinated using database-level locks. Only one request will execute the operation, while other concurrent retries safely block/wait for the result and receive the same response, preventing double-betting under high latency or race conditions.
+  * **Failures/Retries**: If the initial operation fails (e.g., Soroban network error or database timeout), the temporary lock is automatically released, allowing subsequent retries to execute the bet again instead of caching a failed state.
+
+---
+
 ### Leaderboard & User Stats
 
 #### Get Global Leaderboard
@@ -2044,6 +2110,24 @@ curl -X POST http://localhost:3001/api/predictions/submit \
   -d '{"roundId": "ROUND_ID", "amount": 10, "side": "UP"}'
 ```
 
+#### Submit UP/DOWN Bet (requires JWT)
+
+Wallet authentication uses the challenge/connect flow above. Bets are bound to the JWT wallet; unauthenticated attempts return `401`.
+
+```bash
+curl -X POST http://localhost:3000/api/bets/up-down \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_JWT" \
+  -d '{"amount": 10, "side": "UP"}'
+```
+
+```bash
+# Unauthenticated — rejected
+curl -X POST http://localhost:3000/api/bets/up-down \
+  -H "Content-Type: application/json" \
+  -d '{"amount": 10, "side": "UP"}'
+```
+
 #### Get User Profile (requires JWT)
 
 ```bash
@@ -2165,6 +2249,64 @@ When a client exceeds a limit, the API returns **429** with retry guidance:
 ```
 
 The `RateLimit-*` and `Retry-After` response headers are also set (`standardHeaders: true`).
+
+---
+
+## Incident Response Runbook & Alert Configuration
+
+This section provides operational guidance for backend system administrators monitoring rate-limiting telemetry.
+
+### 1. Telemetry Overview
+We track rate-limit occurrences using the Prometheus counter `http_rate_limit_hits_total`, which includes the following sub-labels:
+- `endpoint`: The specific API path that was throttled (e.g., `auth/challenge`, `prediction/submit`).
+- `method`: The HTTP request method (e.g., `POST`, `GET`).
+
+### 2. Monitoring & Scraping Endpoints
+Operators can access the telemetry data via the following endpoints:
+- **Prometheus Scrape Path**: `GET /api/admin/metrics/metrics`  
+  Returns the flat-text Prometheus exposition format for all registered metrics (including `http_rate_limit_hits_total`).
+- **Admin JSON Summary**: `GET /api/admin/metrics/rate-limit-summary`  
+  Returns an optimized JSON configuration payload detailing active counter maps. Gated by admin authentication.
+
+### 3. Recommended Alerting Rules
+Configure your Prometheus/Alertmanager or Grafana alerts with the following recommended thresholds:
+
+| Alert Name | PromQL Expression | Severity | Description |
+| :--- | :--- | :--- | :--- |
+| `HighRateLimitHitsWarning` | `sum(rate(http_rate_limit_hits_total[5m])) by (endpoint) > 0.5` | Warning | Rate of 429 hits exceeds 30 per minute on any endpoint. Indicates potential client misbehavior or mild scraping. |
+| `HighRateLimitHitsCritical` | `sum(rate(http_rate_limit_hits_total[5m])) by (endpoint) > 5.0` | Critical | Rate of 429 hits exceeds 300 per minute. Indicates a potential brute-force or DDoS attack. |
+
+### 4. Triage & Incident Response Steps
+
+When an alert triggers, follow these steps to investigate and resolve the issue:
+
+#### Step 1: Identify the Target & Scale
+Query the active counter maps using the admin summary endpoint or Grafana dashboard:
+```bash
+curl -H "Authorization: Bearer <ADMIN_JWT>" http://localhost:3000/api/admin/metrics/rate-limit-summary
+```
+Identify:
+1. Which **endpoints** are experiencing the highest rate of 429s.
+2. The **volume** of hits (spikes vs. sustained rate).
+
+#### Step 2: Correlate with Database Metrics
+Query the database-backed rate-limit logs to identify the offending IP addresses and/or user IDs:
+```bash
+curl -H "Authorization: Bearer <ADMIN_JWT>" http://localhost:3000/api/admin/metrics/rate-limits?limit=50
+```
+Analyze the `topAbusers` and `flaggedActors` fields to pinpoint the source of the traffic.
+
+#### Step 3: Determine the Nature of the Traffic
+- **Organic Spike**: If the hits are distributed across many different IPs and correspond to a high-profile prediction event or round resolution, it is likely organic. Consider temporarily raising the rate limit thresholds (e.g. via environment variables `BATCH_PREDICTION_RATE_LIMIT_MAX`).
+- **Malicious/Abusive**: If a single IP or user account is responsible for a disproportionate number of hits, treat it as an abuse incident.
+
+#### Step 4: Mitigation Actions
+- **IP Blocking**: If the traffic is malicious and coming from a small set of IPs, block them at the cloud firewall/load balancer level (e.g., Cloudflare, AWS WAF, Render header rules) before they reach the backend.
+- **Tune Limits**: If legitimate users are getting throttled, adjust the rate limit configuration in the environment variables:
+  - `BATCH_PREDICTION_RATE_LIMIT_MAX`
+  - `BATCH_PREDICTION_RATE_LIMIT_WINDOW_MS`
+  - `RATE_LIMIT_SUSPICIOUS_HIT_THRESHOLD`
+  Restart the service to apply changes.
 
 ---
 

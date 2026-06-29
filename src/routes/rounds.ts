@@ -2,31 +2,59 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { betRateLimiter } from '../middleware/rateLimiter';
 import { validate } from '../middleware/validate.middleware';
 import { upDownBetSchema, precisionBetSchema } from '../schemas/bets.schema';
-import { getRepositories } from '../repositories';
 
+import { getRepositories } from '../repositories';
+import config from '../config';
+import hackathonService from '../services/hackathon.service';
+import sorobanService from '../services/soroban.service';
+import { getMockRounds } from '../data/mockData';
+import { mapSorobanActiveRound } from '../utils/soroban-round.mapper';
+import logger from '../utils/logger';
 const router = Router();
 
 /**
  * @openapi
  * /api/rounds:
  *   get:
- *     summary: List mock prediction rounds
+ *     summary: List active prediction rounds
+ *     description: Returns on-chain active round when Soroban is configured; falls back to mock rounds when RPC is unavailable or ROUNDS_MOCK_MODE=true.
  *     tags:
  *       - rounds
  *     responses:
  *       200:
- *         description: Active and upcoming mock rounds
+ *         description: Active rounds with source metadata
  *         content:
  *           application/json:
  *             schema:
- *               type: array
- *               items:
- *                 type: object
+ *               type: object
+ *               properties:
+ *                 source:
+ *                   type: string
+ *                   enum: [soroban, mock]
+ *                 rounds:
+ *                   type: array
+ *                   items:
+ *                     type: object
  */
-router.get('/', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/', async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const rounds = await getRepositories().rounds.listActiveRounds();
     return res.json(rounds);
+    if (!config.app.roundsMockMode) {
+      try {
+        const onChainRound = await sorobanService.getActiveRound();
+        if (onChainRound) {
+          const mapped = mapSorobanActiveRound(onChainRound);
+          return res.json({ source: 'soroban', rounds: [mapped] });
+        }
+      } catch (err) {
+        logger.warn('Soroban fetch failed; falling back to mock rounds', {
+          error: (err as Error).message,
+        });
+      }
+    }
+
+    return res.json({ source: 'mock', rounds: getMockRounds() });
   } catch (err) {
     next(err);
   }
